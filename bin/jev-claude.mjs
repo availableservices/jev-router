@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, mkdirSync, accessSync, constants } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { startProxy } from "../src/proxy.mjs";
+import { resolveClaude } from "../src/claude-cli.mjs";
 import { AUTO_MODEL } from "../src/config.mjs";
 import { readSavedModel, restoreSavedModel } from "../src/settings.mjs";
 import { LOG_FILE } from "../src/log.mjs";
@@ -82,30 +83,6 @@ for (const file of [
   } catch {
     // Missing or unreadable; the key may still come from the real environment.
   }
-}
-
-/**
- * Finds the Claude Code executable on PATH. Resolving it here rather than leaning on the
- * shell means arguments are passed as an array (no quoting hazard, no DEP0190 warning) and
- * a missing install produces a useful message instead of a shell error. Older npm-based
- * installs are a `.cmd` shim, which Node still refuses to run without a shell.
- */
-function resolveClaude() {
-  const win = process.platform === "win32";
-  const exts = win ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";") : [""];
-  for (const dir of (process.env.PATH ?? "").split(win ? ";" : ":")) {
-    if (!dir) continue;
-    for (const ext of exts) {
-      const file = join(dir.replace(/^"|"$/g, ""), `claude${ext}`);
-      try {
-        accessSync(file, constants.X_OK);
-        return { file, shell: /\.(cmd|bat)$/i.test(file) };
-      } catch {
-        // Not here; keep looking.
-      }
-    }
-  }
-  return null;
 }
 
 const args = process.argv.slice(2);

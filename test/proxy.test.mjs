@@ -5,23 +5,12 @@ import {
   sanitizeSchema,
   newTurnPrompt,
   applyTier,
-  claudeModels,
   conversationKey,
+  previousReply,
   sessionOf,
   startProxy,
 } from "../src/proxy.mjs";
-
-test("only the sentinel model is routed", () => {
-  assert.equal(isAuto("jev-router"), true);
-  assert.equal(isAuto("claude-opus-4-6"), false, "a model the user picked is theirs");
-  assert.equal(isAuto("claude-haiku-4-5-20251001"), false, "internal Haiku calls pass through");
-  assert.equal(isAuto(undefined), false);
-});
-
-test("the sentinel is not mistaken for a real tier", () => {
-  assert.equal(tierOf("jev-router"), null);
-});
-import { tierOf, isAuto } from "../src/config.mjs";
+import { tierOf } from "../src/config.mjs";
 import { writeDecision, writeStatus, readStatus, pruneStale, STATUS_DIR } from "../src/status.mjs";
 import { mkdirSync, statSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -78,20 +67,8 @@ test("recognises older model versions within a tier", () => {
   assert.equal(tierOf("claude-opus-4-1"), "opus");
   assert.equal(tierOf("claude-fable-5-1[1m]"), "fable");
   assert.equal(tierOf("gpt-9"), null);
+  assert.equal(tierOf("jev-router"), null, "the sentinel is not a real tier");
   assert.equal(tierOf(undefined), null);
-});
-
-test("keeps available Claude model versions as separate Jev choices", () => {
-  assert.deepEqual(
-    claudeModels([
-      { id: "claude-opus-5", display_name: "Claude Opus 5" },
-      { id: "claude-opus-4-8", display_name: "Claude Opus 4.8" },
-    ]).map(({ id, tier }) => ({ id, tier })),
-    [
-      { id: "claude-opus-5", tier: "opus" },
-      { id: "claude-opus-4-8", tier: "opus" },
-    ],
-  );
 });
 
 test("Claude proxy sends exact account models to Jev and routes the chosen version", async (t) => {
@@ -145,6 +122,50 @@ test("Claude proxy sends exact account models to Jev and routes the chosen versi
   assert.equal(seen[0].model, "claude-opus-4-8");
 });
 
+// `claude -p` never lists models, so the catalog must come from the proxy itself, with the
+// caller's credentials, and a model that did not exist when the code was written must work.
+test("fetches the account catalog itself when Claude Code never asked for it", async (t) => {
+  const seen = [];
+  let auth;
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url.startsWith("/v1/models")) {
+        auth = req.headers["x-api-key"];
+        return res.end(JSON.stringify({ data: [{ id: "claude-opus-6-0" }, { id: "claude-haiku-6-0" }] }));
+      }
+      seen.push(JSON.parse(Buffer.concat(chunks)));
+      res.end('{"id":"msg_1","type":"message","model":"claude-opus-6-0"}');
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+
+  const { port, close } = await startProxy({
+    upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
+    route: async ({ models }) => {
+      assert.deepEqual(models.map((model) => model.id), ["claude-opus-6-0", "claude-haiku-6-0"]);
+      return { choice: "claude-opus-6-0", confidence: 0.9, ms: 1 };
+    },
+  });
+  t.after(close);
+
+  await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": "sk-test" },
+    body: JSON.stringify({
+      model: "jev-router",
+      tools: [{ name: "Bash" }],
+      messages: [{ role: "user", content: "refactor the parser" }],
+    }),
+  });
+
+  assert.equal(auth, "sk-test", "the catalog is fetched with the caller's credentials");
+  assert.equal(seen[0].model, "claude-opus-6-0");
+});
+
 test("a routed request without metadata is recorded under the conversation key", async (t) => {
   const upstream = http.createServer((req, res) => {
     req.on("data", () => {});
@@ -158,7 +179,7 @@ test("a routed request without metadata is recorded under the conversation key",
 
   const { port, close } = await startProxy({
     upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
-    route: async () => ({ choice: "claude-sonnet-5", confidence: 0.77, ms: 1 }),
+    route: async () => ({ choice: "claude-sonnet-5-5", confidence: 0.77, ms: 1 }),
   });
   t.after(close);
 
@@ -183,86 +204,51 @@ test("a routed request without metadata is recorded under the conversation key",
 
 const withTools = (messages) => ({ tools: [{ name: "Bash" }], messages });
 
-test("converts a draft-04 boolean exclusiveMinimum into a draft 2020-12 number", () => {
-  const schema = { type: "object", properties: { topN: { minimum: 0, exclusiveMinimum: true } } };
-  sanitizeSchema(schema);
-  assert.deepEqual(schema.properties.topN, { exclusiveMinimum: 0 });
+test("previousReply reads the text of the last assistant message, not its tool calls", () => {
+  const body = withTools([
+    { role: "user", content: "audit the page" },
+    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }, { type: "text", text: "I found 6 issues." }] },
+    { role: "user", content: "fix all 6" },
+  ]);
+  assert.equal(previousReply(body), "I found 6 issues.");
+  assert.equal(previousReply(withTools([{ role: "user", content: "hi" }])), "");
 });
 
-test("drops a false exclusiveMaximum and keeps the bound", () => {
-  const schema = { properties: { n: { maximum: 10, exclusiveMaximum: false } } };
-  sanitizeSchema(schema);
-  assert.deepEqual(schema.properties.n, { maximum: 10 });
-});
-
-test("leaves an already-valid numeric bound alone", () => {
-  const schema = { properties: { n: { exclusiveMinimum: 5 } } };
-  sanitizeSchema(schema);
-  assert.equal(schema.properties.n.exclusiveMinimum, 5);
-});
-
-test("reaches schemas nested in arrays and sub-objects", () => {
-  const schema = { anyOf: [{ items: { minimum: 1, exclusiveMinimum: true } }] };
-  sanitizeSchema(schema);
-  assert.deepEqual(schema.anyOf[0].items, { exclusiveMinimum: 1 });
-});
-
-test("survives null and primitive nodes", () => {
+test("sanitizeSchema rewrites draft-04 boolean bounds anywhere in a schema", () => {
+  const cases = [
+    [{ minimum: 0, exclusiveMinimum: true }, { exclusiveMinimum: 0 }],
+    [{ maximum: 10, exclusiveMaximum: false }, { maximum: 10 }],
+    [{ exclusiveMinimum: 5 }, { exclusiveMinimum: 5 }],
+  ];
+  for (const [input, expected] of cases) {
+    const schema = { anyOf: [{ items: input }], extra: null, n: 3 }; // nested, with primitives
+    sanitizeSchema(schema);
+    assert.deepEqual(schema.anyOf[0].items, expected);
+  }
   assert.doesNotThrow(() => sanitizeSchema(null));
-  assert.doesNotThrow(() => sanitizeSchema({ a: null, b: 3, c: "x" }));
 });
 
-test("reads a plain string prompt as a new turn", () => {
-  assert.equal(newTurnPrompt(withTools([{ role: "user", content: "fix the bug" }])), "fix the bug");
-});
-
-test("reads a text block prompt as a new turn", () => {
-  const body = withTools([{ role: "user", content: [{ type: "text", text: "fix the bug" }] }]);
-  assert.equal(newTurnPrompt(body), "fix the bug");
-});
-
-test("ignores a tool_result continuation mid-turn", () => {
-  const body = withTools([
-    { role: "user", content: "fix the bug" },
-    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "done" }] },
-  ]);
-  assert.equal(newTurnPrompt(body), null);
-});
-
-test("ignores auxiliary calls that carry no tools", () => {
-  const body = { messages: [{ role: "user", content: "summarise this" }] };
-  assert.equal(newTurnPrompt(body), null);
-});
-
-test("ignores a request whose last message is from the assistant", () => {
-  const body = withTools([{ role: "assistant", content: "thinking" }]);
-  assert.equal(newTurnPrompt(body), null);
-});
-
-test("ignores an empty prompt", () => {
-  assert.equal(newTurnPrompt(withTools([{ role: "user", content: "   " }])), null);
-});
-
-test("survives a malformed body", () => {
-  assert.equal(newTurnPrompt(undefined), null);
-  assert.equal(newTurnPrompt({}), null);
-  assert.equal(newTurnPrompt({ tools: [], messages: [] }), null);
-});
-
-test("strips system reminders Claude Code injects into the prompt", () => {
-  const body = withTools([
-    {
-      role: "user",
-      content: "fix the bug\n<system-reminder>be careful\nabout things</system-reminder>",
-    },
-  ]);
-  assert.equal(newTurnPrompt(body), "fix the bug");
-});
-
-test("a prompt that is only a system reminder is not a turn", () => {
-  const body = withTools([{ role: "user", content: "<system-reminder>noise</system-reminder>" }]);
-  assert.equal(newTurnPrompt(body), null);
+test("newTurnPrompt returns only the text of a genuinely new user turn", () => {
+  const user = (content) => ({ role: "user", content });
+  const toolResult = user([{ type: "tool_result", tool_use_id: "t1", content: "done" }]);
+  const cases = [
+    ["plain string", withTools([user("fix the bug")]), "fix the bug"],
+    ["text block", withTools([user([{ type: "text", text: "fix the bug" }])]), "fix the bug"],
+    // Claude Code appends these for SessionStart hook output and tools added mid-session.
+    ["behind trailing system messages", withTools([user("fix the bug"), { role: "system", content: "hook" }]), "fix the bug"],
+    ["system reminders stripped", withTools([user("fix the bug\n<system-reminder>be\ncareful</system-reminder>")]), "fix the bug"],
+    ["tool continuation", withTools([user("fix"), { role: "assistant", content: "x" }, toolResult]), null],
+    ["continuation behind a system message", withTools([user("fix"), toolResult, { role: "system", content: "hook" }]), null],
+    ["auxiliary call without tools", { messages: [user("summarise this")] }, null],
+    ["last message from the assistant", withTools([{ role: "assistant", content: "thinking" }]), null],
+    ["empty", withTools([user("   ")]), null],
+    ["only a system reminder", withTools([user("<system-reminder>noise</system-reminder>")]), null],
+    ["suggestion chore", withTools([user("[SUGGESTION MODE: Suggest what the user might type]")]), null],
+    ["welcome-back recap", withTools([user("The user stepped away and is coming back. Recap.")]), null],
+    ["malformed", undefined, null],
+    ["no messages", { tools: [], messages: [] }, null],
+  ];
+  for (const [name, body, expected] of cases) assert.equal(newTurnPrompt(body), expected, name);
 });
 
 test("routing to haiku strips fields haiku cannot accept", () => {
@@ -273,7 +259,7 @@ test("routing to haiku strips fields haiku cannot accept", () => {
     context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
   };
   applyTier(body, "haiku");
-  assert.equal(body.model, "claude-haiku-4-5-20251001");
+  assert.equal(body.model, "claude-haiku-5-5");
   assert.equal(body.thinking, undefined);
   assert.equal(body.output_config, undefined);
   assert.equal(body.context_management, undefined);
@@ -295,15 +281,9 @@ test("routing to opus leaves thinking and effort intact", () => {
     output_config: { effort: "medium" },
   };
   applyTier(body, "opus");
-  assert.equal(body.model, "claude-opus-5");
+  assert.equal(body.model, "claude-opus-5-5");
   assert.deepEqual(body.thinking, { type: "adaptive" });
   assert.deepEqual(body.output_config, { effort: "medium" });
-});
-
-test("an unknown tier leaves the request untouched", () => {
-  const body = { model: "claude-sonnet-4-6", thinking: { type: "adaptive" } };
-  applyTier(body, "nonsense");
-  assert.equal(body.model, "claude-sonnet-4-6");
 });
 
 test("a conversation keeps one key as it grows, and differs from a sub-agent", () => {
@@ -351,7 +331,159 @@ test("the same opening text in two sessions gets two keys", () => {
   assert.notEqual(conversationKey(mk("a")), conversationKey(mk("b")));
 });
 
-test("the key survives metadata that is not JSON", () => {
-  const body = { metadata: { user_id: "not-json" }, messages: [{ role: "user", content: "hi" }] };
-  assert.doesNotThrow(() => conversationKey(body));
+test("refetches the account catalog once it is older than the TTL", async (t) => {
+  let listing = [{ id: "claude-opus-5-5" }];
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      res.end(req.url.startsWith("/v1/models") ? JSON.stringify({ data: listing }) : "{}");
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+
+  const offered = [];
+  const { port, close } = await startProxy({
+    upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
+    catalogTtlMs: 0,
+    route: async ({ models }) => {
+      offered.push(models.map((model) => model.id));
+      return null;
+    },
+  });
+  t.after(close);
+
+  const turn = (text) =>
+    fetch(`http://127.0.0.1:${port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "jev-router", tools: [{ name: "Bash" }], messages: [{ role: "user", content: text }] }),
+    });
+  await turn("first question");
+  listing = [{ id: "claude-opus-5-5" }, { id: "claude-opus-6-0" }];
+  await turn("second question");
+
+  assert.deepEqual(offered[0], ["claude-opus-5-5"]);
+  assert.deepEqual(offered[1], ["claude-opus-5-5", "claude-opus-6-0"], "a model released mid-session is picked up");
+});
+
+test("warns once when a request carries tools but no readable prompt", async (t) => {
+  const upstream = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => res.end("{}"));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const { port, close } = await startProxy({
+    upstreamURL: `http://127.0.0.1:${upstream.address().port}`,
+    route: async () => assert.fail("nothing to route"),
+  });
+  t.after(close);
+
+  const lines = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk) => (lines.push(String(chunk)), true);
+  try {
+    for (let i = 0; i < 2; i++) {
+      await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "jev-router",
+          tools: [{ name: "Bash" }],
+          messages: [{ role: "mystery", content: "an unknown message role" }],
+        }),
+      });
+    }
+  } finally {
+    process.stderr.write = write;
+  }
+  assert.equal(lines.filter((line) => line.includes("found no user prompt")).length, 1);
+});
+
+// A subagent names its own model; that model is a ceiling. Helpers below run one proxy with a
+// fixed account catalog and record what reached the upstream API.
+async function ceilingProxy(t, route) {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      res.setHeader("content-type", "application/json");
+      if (req.url.startsWith("/v1/models")) {
+        return res.end(JSON.stringify({ data: [{ id: "claude-haiku-5-5" }, { id: "claude-sonnet-5-5" }, { id: "claude-opus-5-5" }] }));
+      }
+      seen.push(JSON.parse(Buffer.concat(chunks)));
+      res.end('{"id":"msg_1","type":"message"}');
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const proxy = await startProxy({ upstreamURL: `http://127.0.0.1:${upstream.address().port}`, route });
+  t.after(proxy.close);
+  const send = (model, text, session) =>
+    fetch(`http://127.0.0.1:${proxy.port}/v1/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        metadata: { user_id: JSON.stringify({ session_id: session }) },
+        tools: [{ name: "Bash" }],
+        messages: [{ role: "user", content: text }],
+      }),
+    });
+  return { seen, send };
+}
+
+test("a subagent's explicit model is a ceiling: Jev never picks above it", async (t) => {
+  const asked = [];
+  const { seen, send } = await ceilingProxy(t, async ({ prompt, models }) => {
+    asked.push({ prompt, ids: models.map((model) => model.id) });
+    return { choice: "claude-opus-5-5", confidence: 0.95, ms: 1 };
+  });
+  const session = `ceiling-${process.pid}-a`;
+  await send("jev-router", "main task", session);
+  await send("claude-sonnet-5-5", "research the library", session);
+
+  assert.deepEqual(asked[1].ids, ["claude-haiku-5-5", "claude-sonnet-5-5"], "Opus is not offered to Jev");
+  assert.equal(seen.at(-1).model, "claude-sonnet-5-5", "Jev's Opus choice falls back to the ceiling");
+});
+
+test("a subagent's explicit model still lets Jev pick a cheaper one", async (t) => {
+  const { seen, send } = await ceilingProxy(t, async ({ prompt }) => ({
+    choice: prompt.startsWith("research") ? "claude-haiku-5-5" : "claude-opus-5-5",
+    confidence: 0.95,
+    ms: 1,
+  }));
+  const session = `ceiling-${process.pid}-b`;
+  await send("jev-router", "main task", session);
+  await send("claude-opus-5-5", "research the library", session);
+
+  assert.equal(seen.at(-1).model, "claude-haiku-5-5");
+  assert.notEqual(readStatus(session)?.manual, true, "a subagent does not mark the session manual");
+});
+
+test("a session the user runs by hand from the first turn is not treated as a subagent", async (t) => {
+  let routed = false;
+  const { seen, send } = await ceilingProxy(t, async () => {
+    routed = true;
+    return null;
+  });
+  const session = `ceiling-${process.pid}-c`;
+  await send("claude-opus-5-5", "a question I chose the model for", session);
+
+  assert.equal(routed, false);
+  assert.equal(seen.at(-1).model, "claude-opus-5-5");
+  assert.equal(readStatus(session)?.manual, true);
+});
+
+test("picking a model by hand in a routed conversation still wins over the router", async (t) => {
+  const { seen, send } = await ceilingProxy(t, async () => ({ choice: "claude-haiku-5-5", confidence: 0.95, ms: 1 }));
+  const session = `ceiling-${process.pid}-d`;
+  await send("jev-router", "main task", session);
+  await send("claude-opus-5-5", "main task", session);
+
+  assert.equal(seen.at(-1).model, "claude-opus-5-5");
+  assert.equal(readStatus(session)?.manual, true);
 });

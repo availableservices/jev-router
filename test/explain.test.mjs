@@ -7,11 +7,12 @@ test("formats the last routing decision", () => {
   const output = formatExplanation({
     prompt: "Explain the router architecture",
     tier: "sonnet",
+    model: "claude-sonnet-5-5",
     confidence: 0.94,
-    reason: "jev",
+    reason: "low-confidence-no-downgrade",
     jev: {
       request: { state: { session: { current_model: "haiku", context_tokens: 6200 } } },
-      response: { answers: { model_tier: { choice: "sonnet" } } },
+      response: { answers: { model: { choice: "claude-haiku-5-5" } } },
     },
     metrics: {
       taskComplexity: 0.82,
@@ -25,10 +26,15 @@ test("formats the last routing decision", () => {
   assert.match(output, /Prompt: Explain the router/);
   assert.match(output, /Current tier: HAIKU/);
   assert.match(output, /Context tokens: 6200/);
-  assert.match(output, /Recommended tier: SONNET/);
-  assert.match(output, /Selected model: SONNET/);
+  // Jev's recommendation and the model policy selected must be reported separately.
+  assert.match(output, /Recommended model:\s+│\n│ CLAUDE-HAIKU-5-5/);
+  assert.match(output, /Selected model:\s+│\n│ CLAUDE-SONNET-5-5/);
   assert.match(output, /Confidence: 94%/);
-  assert.match(output, /Decision: Jev recommendation/);
+  assert.match(output, /Decision: low confidence; held/);
+});
+
+test("falls back to the selected tier when Jev's own answer was not recorded", () => {
+  assert.match(formatExplanation({ tier: "opus", confidence: 0.5 }), /Recommended model: OPUS/);
 });
 
 test("shows the concrete provider model when available", () => {

@@ -32,8 +32,18 @@ test("an explicit user override beats Jev", () => {
 test("detectOverride only fires on a real instruction", () => {
   assert.equal(detectOverride("switch to opus"), "opus");
   assert.equal(detectOverride("use luna"), "haiku");
-  assert.equal(detectOverride("use strong"), "opus");
+  assert.equal(detectOverride("use the strong model"), "opus");
   assert.equal(detectOverride("the opus of his career"), null);
+  // Everyday phrases that used to force a tier.
+  for (const p of [
+    "implement the cache with fast invalidation",
+    "optimize the worker on long running jobs",
+    "add validation with strong typing",
+    "use strong typing here",
+    "refactor to use balanced trees",
+    "use fast-glob for this",
+    "write the migration on sol rows",
+  ]) assert.equal(detectOverride(p), null, p);
 });
 
 test("keeps the current model when Jev is unreachable", () => {
@@ -50,6 +60,12 @@ test("ignores a tier name Jev invented", () => {
 test("never downgrades on a low-confidence answer", () => {
   const out = decide({ ...base, jev: unsure("haiku") });
   assert.equal(out.tier, "sonnet");
+  assert.match(out.reason, /low-confidence-no-downgrade/);
+});
+
+test("a missing or NaN confidence counts as unsure, not certain", () => {
+  const out = decide({ ...base, current: "opus", jev: { choice: "haiku", confidence: Number.NaN } });
+  assert.equal(out.tier, "opus");
   assert.match(out.reason, /low-confidence-no-downgrade/);
 });
 
@@ -71,6 +87,18 @@ test("refuses a downgrade once the cache rebuild costs more than it saves", () =
 
 test("allows the same downgrade early in a conversation", () => {
   assert.equal(decide({ ...base, current: "opus", jev: sure("haiku") }).tier, "haiku");
+});
+
+// `current` is only a default until a turn has been routed, so there is no cache to protect.
+test("allows a downgrade on the first turn of a large conversation", () => {
+  const out = decide({
+    ...base,
+    current: "opus",
+    jev: sure("haiku"),
+    contextTokens: 80000,
+    cacheBuilt: false,
+  });
+  assert.equal(out.tier, "haiku");
 });
 
 test("substitutes upward when the chosen tier is unavailable", () => {

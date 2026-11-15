@@ -1,0 +1,207 @@
+{
+  "model": "jev-router",
+  "stream": true,
+  "input": [
+    {
+      "type": "additional_tools",
+      "id": "<redacted>",
+      "role": "developer",
+      "tools": [
+        {
+          "type": "namespace",
+          "name": "<redacted>",
+          "description": "<redacted>",
+          "tools": [
+            {
+              "type": "custom",
+              "name": "<redacted>",
+              "description": "<redacted>",
+              "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "\nstart: pragma_source | plain_source\npragma_source: PRAGMA_LINE NEWLINE SOURCE\nplain_source: SOURCE\n\nPRAGMA_LINE: /[ \\t]*\\/\\/ @exec:[^\\r\\n]*/\nNEWLINE: /\\r?\\n/\nSOURCE: /[\\s\\S]+/\n"
+              }
+            },
+            {
+              "type": "function",
+              "name": "<redacted>",
+              "description": "<redacted>",
+              "strict": false,
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "cell_id": {
+                    "type": "string",
+                    "description": "<redacted>"
+                  },
+                  "max_tokens": {
+                    "type": "number",
+                    "description": "<redacted>"
+                  },
+                  "terminate": {
+                    "type": "boolean",
+                    "description": "<redacted>"
+                  },
+                  "yield_time_ms": {
+                    "type": "number",
+                    "description": "<redacted>"
+                  }
+                },
+                "required": [
+                  "cell_id"
+                ],
+                "additionalProperties": false
+              }
+            }
+          ]
+        },
+        {
+          "type": "namespace",
+          "name": "<redacted>",
+          "description": "<redacted>",
+          "tools": [
+            {
+              "type": "function",
+              "name": "<redacted>",
+              "description": "<redacted>",
+              "strict": false,
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "duration_ms": {
+                    "type": "number",
+                    "description": "<redacted>"
+                  }
+                },
+                "required": [
+                  "duration_ms"
+                ],
+                "additionalProperties": false
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "<redacted>",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "<redacted>",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        },
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        },
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        },
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        },
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "<redacted>",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "<redacted>",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "<redacted>",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        },
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "<redacted>",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<redacted>"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "<redacted>",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "what is 2+2?"
+        }
+      ]
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": false,
+  "reasoning": {
+    "effort": "high",
+    "context": "all_turns"
+  },
+  "store": false,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "prompt_cache_key": "00000000-0000-4000-8000-000000000000",
+  "text": {
+    "verbosity": "low"
+  },
+  "client_metadata": {
+    "x-codex-window-id": "<redacted>",
+    "x-codex-turn-metadata": "<redacted>",
+    "turn_id": "<redacted>",
+    "x-codex-installation-id": "<redacted>",
+    "session_id": "<redacted>",
+    "thread_id": "<redacted>",
+    "root_turn_id": "<redacted>"
+  }
+}

@@ -9,10 +9,10 @@ import { choice, score } from "@typesafe-ai/sdk";
  * those fields have to be stripped when routing down to it.
  */
 export const TIERS = [
-  { name: "haiku", id: "claude-haiku-4-5-20251001", family: "haiku", thinking: false, effort: false },
-  { name: "sonnet", id: "claude-sonnet-5", family: "sonnet", thinking: true, effort: true },
-  { name: "opus", id: "claude-opus-5", family: "opus", thinking: true, effort: true },
-  { name: "fable", id: "claude-fable-5-1", family: "fable", thinking: true, effort: true },
+  { name: "haiku", id: "claude-haiku-5-5", family: "haiku", thinking: false, effort: false },
+  { name: "sonnet", id: "claude-sonnet-5-5", family: "sonnet", thinking: true, effort: true },
+  { name: "opus", id: "claude-opus-5-5", family: "opus", thinking: true, effort: true },
+  { name: "fable", id: "claude-fable-5-2", family: "fable", thinking: true, effort: true },
 ];
 
 export const TIER_NAMES = TIERS.map((t) => t.name);
@@ -64,6 +64,13 @@ export const THRESHOLDS = {
   jevTimeoutMs: 1500,
   jevDeadlineMs: 3000,
   jevMaxRetries: 1,
+  /** After this many failed asks in a row Jev is skipped for `jevBreakerCooldownMs`, not retried every turn. */
+  jevBreakerFailures: 3,
+  jevBreakerCooldownMs: 60 * 1000,
+  /** Providers drop an idle prompt cache after about this long, so a downgrade then costs nothing extra. */
+  cacheTtlMs: 5 * 60 * 1000,
+  /** How long the account's model list is trusted before the next routed turn refetches it. */
+  catalogTtlMs: 60 * 60 * 1000,
 };
 
 export const CONTEXT_WINDOW_TOKENS = 200000;
@@ -84,15 +91,14 @@ const COMPLEXITY_SCALE = [
 export const COMPLEXITY_MAX_SCORE = COMPLEXITY_SCALE.length - 1;
 
 /** Phrases that mean "the human already decided", checked against the raw prompt. */
+const MODEL_NAMES = { haiku: "haiku|luna", sonnet: "sonnet|terra", opus: "opus|sol", fable: "fable|astra" };
+// Everyday words ("fast", "strong", "long") only count as "<word> model" after "use"/"switch to":
+// "with fast invalidation" or "on long running jobs" is not a model request.
+const MODEL_ALIASES = { haiku: "fast", sonnet: "balanced", opus: "strong", fable: "long" };
 export const OVERRIDE_PATTERNS = TIERS.map((t) => ({
   tier: t.name,
   re: new RegExp(
-    `\\b(?:use|switch to|with|on)\\s+(?:${{
-      haiku: "haiku|fast|luna",
-      sonnet: "sonnet|balanced|terra",
-      opus: "opus|strong|sol",
-      fable: "fable|long|astra",
-    }[t.name]})\\b`,
+    `\\b(?:use|switch to)\\s+(?:the\\s+)?(?:(?:${MODEL_NAMES[t.name]})(?![-\\w.])|(?:${MODEL_ALIASES[t.name]})\\s+model\\b)`,
     "i",
   ),
 }));
@@ -148,6 +154,36 @@ export const questionForModels = (models) =>
         { model: description ?? id, ...GUIDANCE[tier] },
       ]),
     ),
+  );
+
+/** Whether Jev also picks how much reasoning effort a turn needs. On unless JEV_EFFORT=0. */
+export const effortEnabled = () => process.env.JEV_EFFORT !== "0";
+
+export const effortQuestion = () =>
+  choice(
+    [
+      "Pick how much reasoning effort this request needs to be answered correctly. Lower effort is cheaper, but a wrong answer costs more than the tokens saved.",
+    ],
+    {
+      low: {
+        what: "Mechanical or local work with one obvious answer.",
+        signals: ["Rename, typo fix, one-line change, direct factual question"],
+        not_for: "Anything that needs reasoning across several steps.",
+      },
+      medium: {
+        what: "Ordinary work with a clear shape and a few steps.",
+        signals: [
+          "Implement a specified function, add a test for existing behaviour",
+          "Explain, summarise or walk through existing code",
+        ],
+        not_for: "Unknown-cause debugging or design trade-offs.",
+      },
+      high: {
+        what: "Work where a shallow answer would be wrong.",
+        signals: ["Debugging with an unknown cause, concurrency, security, cross-module design"],
+        not_for: "Routine edits, or explaining code that already works.",
+      },
+    },
   );
 
 /** Whether policy accepted Jev's exact model, including a version change within one tier. */

@@ -12,11 +12,13 @@
   "bin": {
     "jev-claude": "bin/jev-claude.mjs",
     "jev-codex": "bin/jev-codex.mjs",
-    "jev-explain": "bin/jev-explain.mjs"
+    "jev-explain": "bin/jev-explain.mjs",
+    "jev-doctor": "bin/jev-doctor.mjs"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.mjs\"",
-    "prepublishOnly": "npm test"
+    "test": "node --import ./test/setup.mjs --test \"test/**/*.test.mjs\"",
+    "prepublishOnly": "npm test",
+    "eval": "node test/eval/run.mjs"
   },
   "files": [
     ".claude/skills",

@@ -1,23 +1,26 @@
 import http from "node:http";
-import https from "node:https";
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import {
-  TIERS,
-  tierOf,
-  idOf,
-  availableTiers,
-  tierSpec,
-  isAuto,
-  shouldUseExactModel,
-} from "./config.mjs";
+import { TIERS, THRESHOLDS, tierOf, idOf, availableTiers, tierSpec, isAuto, rankOf } from "./config.mjs";
+import { forward } from "./forward.mjs";
 import { askJev } from "./router.mjs";
-import { decide } from "./policy.mjs";
-import { log } from "./log.mjs";
-import { writeDecision, writeStatus } from "./status.mjs";
+import { debug, dumpBody, log } from "./log.mjs";
+import { markManual, recordUsage, writeDecision } from "./status.mjs";
+import { cacheIsWarm, remember, routeTurn } from "./turn.mjs";
+import { usageFromBody } from "./usage.mjs";
+
+const EFFORTS = ["low", "medium", "high"];
+
+/**
+ * Lowers the request's reasoning effort to what Jev chose, never raises it. Claude Code's own
+ * setting is the ceiling, the same way a sub-agent's model is.
+ */
+export function lowerEffort(body, effort) {
+  const current = body.output_config?.effort;
+  if (!EFFORTS.includes(effort) || !EFFORTS.includes(current)) return;
+  if (EFFORTS.indexOf(effort) < EFFORTS.indexOf(current)) body.output_config.effort = effort;
+}
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
-const debug = (line) => process.env.JEV_DEBUG && log(line);
 
 /**
  * Claude Code converts draft-04 relics in MCP tool schemas before sending them first-party,
@@ -51,10 +54,17 @@ export function sanitizeSchema(node) {
  * Jev on every tool call and let the model flip mid-task, so only the opening request of a
  * turn counts. Claude Code also injects `<system-reminder>` blocks into the user message,
  * which are noise to a router and measurably blunt Jev's confidence, so they are removed.
+ *
+ * Claude Code appends trailing `system` messages carrying hook output and tools added
+ * mid-session, so the turn's user message is not always the last one. Only `system` is
+ * skipped: a trailing `assistant` message still means the turn is already under way.
  */
 export function newTurnPrompt(body) {
   if (!Array.isArray(body?.tools) || body.tools.length === 0) return null; // auxiliary call
-  const last = body?.messages?.[body.messages.length - 1];
+  const messages = body?.messages ?? [];
+  let index = messages.length - 1;
+  while (index >= 0 && messages[index]?.role === "system") index--;
+  const last = messages[index];
   if (!last || last.role !== "user") return null;
   let text;
   if (typeof last.content === "string") {
@@ -68,8 +78,28 @@ export function newTurnPrompt(body) {
   } else {
     return null;
   }
-  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim() || null;
+  const prompt = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+  return prompt && !isClaudeAuxiliaryPrompt(prompt) ? prompt : null;
 }
+
+/** Text of the assistant reply the new prompt answers, or "" at the start of a conversation. */
+export function previousReply(body) {
+  const reply = body?.messages?.findLast((message) => message?.role === "assistant");
+  if (typeof reply?.content === "string") return reply.content;
+  if (!Array.isArray(reply?.content)) return "";
+  return reply.content
+    .filter((b) => b?.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+
+/**
+ * Requests Claude Code makes on its own inside the main conversation (next-prompt suggestions,
+ * the "welcome back" recap). They carry tools like a real turn, but routing them would let a
+ * background chore switch the conversation's model and throw away its prompt cache.
+ */
+const isClaudeAuxiliaryPrompt = (prompt) =>
+  /^\[SUGGESTION MODE:|^The user stepped away and is coming back\./.test(prompt);
 
 /**
  * Points a request at a tier, removing request fields that tier cannot accept. Claude Code
@@ -154,195 +184,278 @@ export function conversationKey(body) {
   return createHash("sha1").update(`${session}|${text}`).digest("hex").slice(0, 12);
 }
 
-/**
- * Records the tier Claude Code is asking for and reports whether the user has taken manual
- * control. The first tier seen in a conversation is the baseline; any later change means the
- * user picked a model with /model, and an explicit choice must beat the router. Compared by
- * tier rather than exact model id, because Claude Code varies the id within a tier.
- */
-export function observeModel(state, current) {
-  state.baseline ??= current;
-  if (current !== state.baseline) state.manual = true;
-  return state.manual;
-}
-
-
-export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = askJev } = {}) {
+export async function startProxy({
+  upstreamURL = ANTHROPIC_BASE_URL,
+  route = askJev,
+  catalogTtlMs = THRESHOLDS.catalogTtlMs,
+} = {}) {
   // Tier routed for each conversation's turn in flight, reused by its follow-up requests and
   // by the cache-rebuild guard, which needs to know what the prompt cache was built on.
   const convos = new Map();
   const catalog = new Map();
-  const stateFor = (key) => {
-    let s = convos.get(key);
-    if (!s) {
-      if (convos.size > 50) convos.delete(convos.keys().next().value);
-      convos.set(key, (s = { tier: null }));
+  let catalogAt = 0;
+  let warnedNoPrompt = false;
+  // Touching a conversation keeps it from being evicted while it is still in use.
+  const stateFor = (key) => remember(convos, key, convos.get(key) ?? { tier: null });
+
+  const isModelsList = (req) => req.method === "GET" && /^\/v1\/models(?:\?|$)/.test(req.url ?? "");
+
+  function addToCatalog(models) {
+    for (const model of models ?? []) {
+      if (tierOf(model?.id)) catalog.set(model.id, model);
     }
-    return s;
-  };
+  }
+
+  // Claude Code lists models only when it wants them, and `claude -p` never does, so the
+  // account's catalog is fetched here with the request's own credentials. Without it routing
+  // falls back to the built-in ids, which go stale as soon as a new model ships. It is
+  // refreshed after `catalogTtlMs` so a long session also picks up models released meanwhile.
+  const HOP_BY_HOP = ["host", "connection", "keep-alive", "content-length", "transfer-encoding", "accept-encoding"];
+  async function ensureCatalog(headers) {
+    if (catalog.size && Date.now() - catalogAt < catalogTtlMs) return;
+    const forwarded = Object.fromEntries(Object.entries(headers).filter(([k]) => !HOP_BY_HOP.includes(k)));
+    try {
+      const response = await fetch(`${upstreamURL.replace(/\/$/, "")}/v1/models`, {
+        headers: forwarded,
+        signal: AbortSignal.timeout(THRESHOLDS.jevTimeoutMs),
+      });
+      addToCatalog((await response.json()).data);
+    } catch (err) {
+      debug(`could not fetch Claude model catalog: ${err.message}`);
+    } finally {
+      // Back off after a failed refresh only when there is an older catalog to keep using;
+      // with none, the next turn should try again rather than stay on the built-in ids.
+      if (catalog.size) catalogAt = Date.now();
+    }
+  }
+
+  // A subagent names its own model, from its agent definition or the Agent tool's `model`.
+  // That model is a ceiling, not an order: Jev may pick cheaper, never dearer. Only a
+  // conversation that starts after a routed main conversation is a subagent, so a session
+  // the user runs by hand from its first turn is left alone.
+  function subagentCeilingOf(body, known) {
+    if (isAuto(body.model) || !Array.isArray(body.tools)) return null;
+    if (known) return known.ceiling ?? null;
+    return [...convos.values()].some((s) => s.model && !s.ceiling) ? tierOf(body.model) : null;
+  }
+
+  // Anything that is not the sentinel is a model the user chose, and an explicit choice beats
+  // the router. That also covers Claude Code's own cheap Haiku calls for titles and summaries,
+  // which must never be pinned up to the session's tier.
+  function passThroughUserChoice(body, key, known) {
+    debug(`passthrough, user selected ${body.model}`);
+    // Only a real agent turn reflects the user's choice. Claude Code's own auxiliary
+    // calls carry no tools and must not flip the status line to manual mid-session.
+    if (!Array.isArray(body.tools)) return;
+    markManual(sessionOf(body));
+    // Remember the conversation as manual, so its later turns are not mistaken for a
+    // subagent once the user has picked a model.
+    if (known) known.manual = true;
+    else remember(convos, key, { tier: null, manual: true });
+  }
+
+  // A new conversation starts in the middle: Jev leans toward the model it is told is current
+  // ("explain the codebase" measured opus 0.44 when told opus, sonnet 0.6 when told sonnet),
+  // so starting on opus pulled borderline turns up to opus.
+  const currentTierOf = (state) =>
+    state.tier ?? (state.ceiling && rankOf(state.ceiling) < rankOf("sonnet") ? state.ceiling : "sonnet");
+
+  // The request format is not a public contract. A conversation's first tool-bearing
+  // request with no readable prompt means routing is silently off, so say so once.
+  function warnOnceIfUnroutable(body, state, prompt) {
+    if (prompt || state.tier != null || !body.tools?.length || warnedNoPrompt) return;
+    warnedNoPrompt = true;
+    log(
+      "found no user prompt in this request, so it was not routed. Claude Code's request " +
+        "format may have changed: re-run with JEV_DUMP=<path> and open an issue with the dump.",
+    );
+  }
+
+  /** Asks Jev about a fresh user turn, records the answer on `state`, and returns what to publish. */
+  async function routeFreshTurn({ body, prompt, state, current, warm, key, headers }) {
+    await ensureCatalog(headers);
+    const models = claudeModels([...catalog.values()]).filter(
+      (model) =>
+        availableTiers().includes(model.tier) && (!state.ceiling || rankOf(model.tier) <= rankOf(state.ceiling)),
+    );
+    const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
+    let { tier, reason, model, jev } = await routeTurn({
+      route,
+      prompt,
+      context: previousReply(body),
+      models,
+      current,
+      currentModel: state.model ?? modelForTier(models, current),
+      contextTokens,
+      cacheBuilt: state.tier != null && warm,
+      modelForTier: (t) => modelForTier(models, t),
+    });
+    if (state.ceiling && rankOf(tier) > rankOf(state.ceiling)) {
+      tier = state.ceiling;
+      model = modelForTier(models, tier);
+      reason = `${reason}/capped-by-subagent`;
+    }
+    state.tier = tier;
+    state.model = model;
+    state.effort = jev?.effort ?? null;
+    debug(
+      `${key} ${jev ? `${jev.ms}ms p=${jev.confidence.toFixed(2)}` : "no-jev"} ` +
+        `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
+    );
+    return {
+      prompt,
+      model,
+      confidence: jev?.confidence ?? null,
+      metrics: jev?.metrics ?? null,
+      reason,
+      jev: jev ? { request: jev.request, response: jev.response } : null,
+    };
+  }
+
+  /**
+   * Rewrites a sentinel request to the model chosen for its turn, asking Jev first when the
+   * request opens a new turn. Returns where the response's token usage is filed.
+   */
+  async function routeAuto(body, key, subagentCeiling, headers) {
+    const state = stateFor(key);
+    // Any request refreshes the provider's cache; a long idle gap lets it expire.
+    const warm = cacheIsWarm(state.lastAt);
+    state.lastAt = Date.now();
+    state.manual = false;
+    if (subagentCeiling) state.ceiling = subagentCeiling;
+    // What the prompt cache was built on, which is what a downgrade would discard.
+    const current = currentTierOf(state);
+    const prompt = newTurnPrompt(body);
+    warnOnceIfUnroutable(body, state, prompt);
+    const explaining = prompt?.includes("<jev-explain>");
+    const fresh = prompt && !explaining ? await routeFreshTurn({ body, prompt, state, current, warm, key, headers }) : null;
+
+    // The sentinel is not a real model, so every routed request must be rewritten,
+    // including follow-ups that reuse the tier chosen for the turn.
+    const tier = state.tier ?? current;
+    const model = state.model ?? idOf(tier);
+    debug(`${key} rewrite ${body.model} -> ${model}`);
+    applyTier(body, tier, model);
+    lowerEffort(body, state.effort);
+    const session = sessionOf(body) || key;
+    // Publish what went out. Claude Code's UI shows the row you picked, not the tier it resolved
+    // to, so the status line is the only place this is visible. `claude -p` omits metadata on
+    // the first request, so the conversation key stands in for the session id; it is also what
+    // `debug` prints, so it is what a user passes to `jev-explain` for a print-mode run.
+    // The effort is read after lowerEffort, so the status line shows what was actually sent.
+    if (fresh) writeDecision(session, { tier, ...fresh, effort: body.output_config?.effort ?? null, at: Date.now() });
+    return { session, tier };
+  }
+
+  /** Routes a /v1/messages request. Returns the body to send and where its usage is filed. */
+  async function routeMessages(raw, headers) {
+    let body = null;
+    try {
+      body = JSON.parse(raw.toString());
+      // Claude Code's request shape is undocumented and moves; JEV_DUMP captures it.
+      if (process.env.JEV_DUMP) dumpBody(body);
+      body.tools?.forEach((t) => sanitizeSchema(t.input_schema));
+      const key = conversationKey(body);
+      const known = convos.get(key);
+      const ceiling = subagentCeilingOf(body, known);
+      let usageTarget = null;
+      if (isAuto(body.model) || ceiling) usageTarget = await routeAuto(body, key, ceiling, headers);
+      else passThroughUserChoice(body, key, known);
+      return { out: Buffer.from(JSON.stringify(body)), usageTarget };
+    } catch (err) {
+      debug(`passthrough, could not process body: ${err.message}`);
+      // The sentinel is not a real model: sent as is, the request would fail instead of just
+      // missing its routing.
+      if (body && isAuto(body.model)) {
+        applyTier(body, "sonnet");
+        return { out: Buffer.from(JSON.stringify(body)), usageTarget: null };
+      }
+      return { out: raw, usageTarget: null };
+    }
+  }
+
+  function relayModelList(up, res) {
+    const chunks = [];
+    up.on("data", (chunk) => chunks.push(chunk));
+    up.on("end", () => {
+      const data = Buffer.concat(chunks);
+      try {
+        addToCatalog(JSON.parse(data.toString()).data);
+        if (catalog.size) catalogAt = Date.now();
+      } catch (err) {
+        debug(`could not read Claude model catalog: ${err.message}`);
+      }
+      const { "content-length": _dropped, ...headers } = up.headers;
+      res.writeHead(up.statusCode, headers);
+      res.end(data);
+    });
+  }
+
+  // Report the model the API itself says it used, so the routing can be confirmed from the
+  // wire rather than trusted from our own decision log. Claude Code's UI always shows the model
+  // it asked for, never the one we rewrote to.
+  function debugServedModel(up) {
+    let seen = false;
+    up.on("data", (chunk) => {
+      if (seen) return;
+      const served = /"model"\s*:\s*"([^"]+)"/.exec(chunk.toString("utf8"));
+      if (!served) return;
+      seen = true;
+      debug(`${up.statusCode} served by ${served[1]}`);
+    });
+  }
+
+  function recordResponseUsage(up, { session, tier }) {
+    const chunks = [];
+    up.on("data", (chunk) => chunks.push(chunk));
+    up.on("end", () => recordUsage(session, tier, usageFromBody(Buffer.concat(chunks), up.headers["content-encoding"])));
+  }
+
+  function relay(up, req, res, usageTarget) {
+    if (isModelsList(req)) return relayModelList(up, res);
+    res.writeHead(up.statusCode, up.headers);
+    if (process.env.JEV_DEBUG) debugServedModel(up);
+    if (usageTarget && up.statusCode === 200) recordResponseUsage(up, usageTarget);
+    up.pipe(res);
+  }
+
+  function upstreamHeaders(req) {
+    const headers = { ...req.headers };
+    // The model list is parsed here, and under JEV_DEBUG the stream is read back to see which
+    // model served it, so neither can arrive compressed. Not worth the bandwidth otherwise.
+    if (isModelsList(req) || process.env.JEV_DEBUG) delete headers["accept-encoding"];
+    return headers;
+  }
 
   const server = http.createServer((req, res) => {
     // Claude Code probes the base URL before its first request.
     if (req.method === "HEAD") return res.writeHead(200).end();
 
     const chunks = [];
-    req.on("data", (c) => chunks.push(c));
+    req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", async () => {
-      let out = Buffer.concat(chunks);
-
-      if (/^\/v1\/messages/.test(req.url ?? "")) {
-        try {
-          const body = JSON.parse(out.toString());
-          // Claude Code's request shape is undocumented and moves; JEV_DUMP captures it.
-          if (process.env.JEV_DUMP) {
-            writeFileSync(`${process.env.JEV_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
-          }
-          body.tools?.forEach((t) => sanitizeSchema(t.input_schema));
-
-          // Anything that is not the sentinel is a model the user chose, and an explicit
-          // choice beats the router. That also covers Claude Code's own cheap Haiku calls
-          // for titles and summaries, which must never be pinned up to the session's tier.
-          if (!isAuto(body.model)) {
-            debug(`passthrough, user selected ${body.model}`);
-            // Only a real agent turn reflects the user's choice. Claude Code's own auxiliary
-            // calls carry no tools and must not flip the status line to manual mid-session.
-            if (Array.isArray(body.tools)) {
-              writeStatus(sessionOf(body), { manual: true, at: Date.now() });
-            }
-          } else {
-            const key = conversationKey(body);
-            const state = stateFor(key);
-            // What the prompt cache was built on, which is what a downgrade would discard.
-            const current = state.tier ?? "opus";
-            const prompt = newTurnPrompt(body);
-            const explaining = prompt?.includes("<jev-explain>");
-            let fresh = null;
-            if (prompt && !explaining) {
-              const models = claudeModels([...catalog.values()]).filter((model) =>
-                availableTiers().includes(model.tier),
-              );
-              const available = [...new Set(models.map((model) => model.tier))];
-              const currentModel = state.model ?? modelForTier(models, current);
-              const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
-              const jev = await route({ prompt, current: currentModel, contextTokens, models });
-              const chosen = models.find((model) => model.id === jev?.choice);
-              const tierAnswer = jev && { ...jev, choice: chosen?.tier };
-              const { tier, reason } = decide({
-                prompt,
-                jev: tierAnswer,
-                current,
-                available,
-                contextTokens,
-              });
-              const model =
-                shouldUseExactModel(reason, chosen?.tier, tier)
-                  ? chosen.id
-                  : tier === current
-                    ? currentModel
-                    : modelForTier(models, tier);
-              state.tier = tier;
-              state.model = model;
-              fresh = {
-                prompt,
-                model,
-                confidence: jev?.confidence ?? null,
-                metrics: jev?.metrics ?? null,
-                reason,
-                jev: jev ? { request: jev.request, response: jev.response } : null,
-              };
-              debug(
-                `${key} ${jev ? `${jev.ms}ms p=${jev.confidence.toFixed(2)}` : "no-jev"} ` +
-                  `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
-              );
-            }
-            // The sentinel is not a real model, so every routed request must be rewritten,
-            // including follow-ups that reuse the tier chosen for the turn.
-            const tier = state.tier ?? current;
-            const model = state.model ?? idOf(tier);
-            debug(`${key} rewrite ${body.model} -> ${model}`);
-            applyTier(body, tier, model);
-            // Publish what went out. Claude Code's UI shows the row you picked, not the tier
-            // it resolved to, so the status line is the only place this is visible.
-            // `claude -p` omits metadata on the first request of a session, so there is no
-            // session id to file the decision under and it would be dropped. The conversation
-            // key is stable for the same conversation and is already what `debug` prints, so
-            // it is the identifier a user can pass to `jev-explain` for a print-mode run.
-            if (fresh && !explaining) {
-              writeDecision(sessionOf(body) || key, { tier, ...fresh, at: Date.now() });
-            }
-          }
-          out = Buffer.from(JSON.stringify(body));
-        } catch (err) {
-          debug(`passthrough, could not process body: ${err.message}`);
-        }
-      }
-
-      const target = new URL(upstreamURL);
-      const transport = target.protocol === "http:" ? http : https;
-      const headers = { ...req.headers, host: target.host };
-      delete headers["content-length"];
-      if (req.method === "GET" && /^\/v1\/models(?:\?|$)/.test(req.url ?? "")) {
-        delete headers["accept-encoding"];
-      }
-      // Under JEV_DEBUG, ask for an uncompressed stream so the model the API reports can be
-      // read back out of it. Not worth the bandwidth cost in normal operation.
-      if (process.env.JEV_DEBUG) delete headers["accept-encoding"];
-      const upstream = transport.request(
-        {
-          hostname: target.hostname,
-          port: target.port || undefined,
-          path: `${target.pathname.replace(/\/$/, "")}${req.url}`,
-          method: req.method,
-          headers,
-        },
-        (up) => {
-          const isModels = req.method === "GET" && /^\/v1\/models(?:\?|$)/.test(req.url ?? "");
-          if (isModels) {
-            const chunks = [];
-            up.on("data", (chunk) => chunks.push(chunk));
-            up.on("end", () => {
-              const data = Buffer.concat(chunks);
-              try {
-                for (const model of JSON.parse(data.toString()).data ?? []) {
-                  if (tierOf(model?.id)) catalog.set(model.id, model);
-                }
-              } catch (err) {
-                debug(`could not read Claude model catalog: ${err.message}`);
-              }
-              const headers = { ...up.headers };
-              delete headers["content-length"];
-              res.writeHead(up.statusCode, headers);
-              res.end(data);
-            });
-            return;
-          }
-          res.writeHead(up.statusCode, up.headers);
-          // Report the model the API itself says it used, so the routing can be confirmed
-          // from the wire rather than trusted from our own decision log. Claude Code's UI
-          // always shows the model it asked for, never the one we rewrote to.
-          if (process.env.JEV_DEBUG) {
-            let seen = false;
-            up.on("data", (c) => {
-              if (seen) return;
-              const m = /"model"\s*:\s*"([^"]+)"/.exec(c.toString("utf8"));
-              if (!m) return;
-              seen = true;
-              debug(`${up.statusCode} served by ${m[1]}`);
-            });
-          }
-          up.pipe(res);
-        },
-      );
-      upstream.on("error", (e) => {
-        debug(`upstream error: ${e.message}`);
-        if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ type: "error", error: { message: e.message } }));
+      const raw = Buffer.concat(chunks);
+      const { out, usageTarget } = /^\/v1\/messages/.test(req.url ?? "")
+        ? await routeMessages(raw, req.headers)
+        : { out: raw, usageTarget: null };
+      forward({
+        target: upstreamURL,
+        req,
+        res,
+        headers: upstreamHeaders(req),
+        body: out,
+        errorBody: (message) => ({ type: "error", error: { message } }),
+        onResponse: (up) => relay(up, req, res, usageTarget),
       });
-      if (out.length) upstream.write(out);
-      upstream.end();
     });
   });
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { port: server.address().port, close: () => server.close() };
+  return {
+    port: server.address().port,
+    close: () => {
+      server.close();
+      server.closeAllConnections();
+    },
+  };
 }

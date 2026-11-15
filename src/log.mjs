@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -20,3 +20,15 @@ export function log(line) {
 }
 
 export const debug = (line) => process.env.JEV_DEBUG && log(line);
+
+/**
+ * Saves a request body under `JEV_DUMP` to diagnose wire-format changes. Bodies hold the
+ * user's prompt, so the file is owner-only, and a failed dump must never fail the request.
+ */
+export function dumpBody(body) {
+  try {
+    writeFileSync(`${process.env.JEV_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2), { mode: 0o600 });
+  } catch (err) {
+    log(`could not write JEV_DUMP file: ${err.message}`);
+  }
+}

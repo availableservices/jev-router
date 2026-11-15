@@ -10,6 +10,7 @@ import {
   codexConversationKey,
   codexModels,
   codexNewTurnPrompt,
+  codexPreviousReply,
   isCodexAuxiliaryPrompt,
   jevDecisionEvents,
   startCodexProxy,
@@ -66,6 +67,13 @@ test("reads only fresh Codex user turns", () => {
   assert.equal(isCodexAuxiliaryPrompt("Generate a concise, single-line task title of at most 36 characters"), true);
 });
 
+test("codexPreviousReply reads the last assistant answer, skipping the injected Jev note", () => {
+  const say = (text) => ({ type: "message", role: "assistant", content: [{ type: "output_text", text }] });
+  const body = { input: [say("I found 6 issues."), say("[Jev] routed this turn to gpt-6-luna."), { role: "user", content: "fix all 6" }] };
+  assert.equal(codexPreviousReply(body), "I found 6 issues.");
+  assert.equal(codexPreviousReply({ input: [{ role: "user", content: "hi" }] }), "");
+});
+
 test("keeps sub-agent routing state separate", () => {
   const base = { input: [{ role: "user", content: "same prompt" }] };
   assert.notEqual(
@@ -101,11 +109,11 @@ test("routes subscription auth to ChatGPT and API keys to the public API", () =>
 test("maps tiers and clamps unsupported reasoning effort", () => {
   const body = { model: "jev-router", reasoning: { effort: "max" } };
   const models = new Map([[
-    "gpt-5.6-luna",
+    "gpt-6-luna",
     { default_reasoning_level: "medium", supported_reasoning_levels: [{ effort: "medium" }] },
   ]]);
   applyCodexTier(body, "haiku", models);
-  assert.equal(body.model, "gpt-5.6-luna");
+  assert.equal(body.model, "gpt-6-luna");
   assert.equal(body.reasoning.effort, "medium");
 });
 
@@ -126,7 +134,7 @@ test("surfaces routing as a native commentary event", () => {
   assert.match(events, /response\.output_text\.delta/);
   assert.match(events, /response\.output_item\.done/);
   assert.match(events, /"phase":"commentary"/);
-  assert.match(events, /\[Jev\] routed this turn to gpt-5\.6-sol/);
+  assert.match(events, /\[Jev\] routed this turn to gpt-6\.1-sol/);
   assert.match(events, /confidence 0\.91/);
 
   const unavailable = jevDecisionEvents({
@@ -135,7 +143,7 @@ test("surfaces routing as a native commentary event", () => {
     reason: "jev-unavailable/no-change",
   });
   assert.match(unavailable, /JEV_API_KEY=\.\.\. to ~\/\.jev-router\.env/);
-  assert.match(unavailable, /using gpt-5\.6-terra/);
+  assert.match(unavailable, /using gpt-6\.1-terra/);
 });
 
 test("proxy preserves Codex auth, picker, routing, and native decision output", async (t) => {
@@ -249,17 +257,4 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
   assert.equal(routeCalls, 1);
   assert.equal(readStatus(statusId).confidence, 0.91);
   assert.equal(readStatus(statusId).history.length, 1);
-
-  await fetch(`http://127.0.0.1:${port}/responses`, {
-    method: "POST",
-    headers: { ...headers, "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "jev-router",
-      prompt_cache_key: "main",
-      input: [{ role: "user", content: [{ type: "input_text", text: "$jev-explain" }] }],
-    }),
-  });
-  assert.equal(routeCalls, 1);
-  assert.equal(seen[3].body.model, "gpt-5.6-sol");
-  assert.equal(readStatus(statusId).metrics.reasoningRequired, 0.91);
 });

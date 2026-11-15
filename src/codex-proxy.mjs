@@ -1,20 +1,20 @@
 import http from "node:http";
-import https from "node:https";
 import { createHash, randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { availableTiers, shouldUseExactModel } from "./config.mjs";
+import { availableTiers, rankOf } from "./config.mjs";
+import { forward } from "./forward.mjs";
 import { askJev } from "./router.mjs";
-import { decide } from "./policy.mjs";
-import { log } from "./log.mjs";
-import { writeDecision, writeStatus } from "./status.mjs";
+import { debug, dumpBody } from "./log.mjs";
+import { markManual, recordUsage, writeDecision } from "./status.mjs";
+import { cacheIsWarm, remember, routeTurn } from "./turn.mjs";
+import { usageFromBody } from "./usage.mjs";
 
 const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const API_BASE_URL = "https://api.openai.com/v1";
 export const CODEX_AUTO_MODEL = "jev-router";
 const DEFAULT_MODELS = {
-  haiku: "gpt-5.6-luna",
-  sonnet: "gpt-5.6-terra",
-  opus: "gpt-5.6-sol",
+  haiku: "gpt-6-luna",
+  sonnet: "gpt-6.1-terra",
+  opus: "gpt-6.1-sol",
   fable: "gpt-6-astra",
 };
 const MODEL_ENV = {
@@ -38,7 +38,7 @@ export function codexTierOf(model) {
 /** Exact GPT models in Codex's account catalog; configured ids are the cold-start fallback. */
 export function codexModels(models = new Map()) {
   const available = [...models.values()]
-    .filter((model) => model.slug !== CODEX_AUTO_MODEL && model.supported_in_api !== false)
+    .filter((model) => model.slug !== CODEX_AUTO_MODEL && model.supported_in_api !== false && model.visibility !== "hide")
     .map((model) => ({
       id: model.slug,
       tier: codexTierOf(model.slug),
@@ -65,7 +65,7 @@ const textOf = (content) => {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
-    .filter((item) => item?.type === "text" || item?.type === "input_text")
+    .filter((item) => item?.type === "text" || item?.type === "input_text" || item?.type === "output_text")
     .map((item) => item.text)
     .join("\n");
 };
@@ -80,6 +80,17 @@ const cleanPrompt = (text) =>
 export const isCodexAuxiliaryPrompt = (prompt) =>
   /^Generate a concise, single-line task title\b/i.test(prompt);
 
+/** Text of the assistant reply the new prompt answers, skipping the "[Jev] routed" notes we inject. */
+export function codexPreviousReply(body) {
+  if (!Array.isArray(body?.input)) return "";
+  for (const item of [...body.input].reverse()) {
+    if (item?.role !== "assistant") continue;
+    const text = textOf(item.content).trim();
+    if (text && !text.startsWith("[Jev]")) return text;
+  }
+  return "";
+}
+
 /** User text that starts a new Codex turn, or null for tool continuations. */
 export function codexNewTurnPrompt(body) {
   if (!Array.isArray(body?.input)) return null;
@@ -88,13 +99,16 @@ export function codexNewTurnPrompt(body) {
     if (item?.type === "function_call_output" || item?.type === "custom_tool_call_output") return null;
     if (item?.role !== "user") continue;
     const prompt = cleanPrompt(textOf(item.content));
-    if (prompt && !isCodexAuxiliaryPrompt(prompt)) return prompt;
+    // Codex puts the project's AGENTS.md in a user message; a turn with no typed text (an image
+    // only) must not fall back to it and send the whole file to Jev as the request.
+    if (prompt && !isCodexAuxiliaryPrompt(prompt) && !/^# AGENTS\.md instructions/i.test(prompt)) return prompt;
   }
   return null;
 }
 
 export function codexConversationKey(body) {
   const stable =
+    body?.client_metadata?.["x-codex-window-id"] ??
     body?.prompt_cache_key ??
     body?.client_metadata?.["x-codex-turn-metadata"] ??
     `${body?.instructions ?? ""}|${textOf(body?.input?.find((item) => item?.role === "user")?.content)}`;
@@ -121,6 +135,19 @@ export function addJevModel(catalog) {
     upgrade: null,
   });
   return catalog;
+}
+
+const CODEX_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+
+/**
+ * Sets the request's reasoning effort to what Jev chose, up or down: the jev-router entry has a
+ * fixed default effort, so lowering alone would leave hard turns on it. Jev's scale stops at
+ * "high", so "high" never overrules a user who chose xhigh/max.
+ */
+export function setCodexEffort(body, effort) {
+  if (!body.reasoning || !["low", "medium", "high"].includes(effort)) return;
+  if (effort === "high" && CODEX_EFFORTS.indexOf(body.reasoning.effort) > CODEX_EFFORTS.indexOf("high")) return;
+  body.reasoning.effort = effort;
 }
 
 export function applyCodexTier(body, tier, models = new Map(), model = codexModelOf(tier)) {
@@ -161,8 +188,8 @@ export function jevDecisionEvents({ tier, model = codexModelOf(tier), confidence
   return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 }
 
-const debug = (line) => process.env.JEV_DEBUG && log(line);
-const upstreamPath = (base, path) => `${new URL(base).pathname.replace(/\/$/, "")}${path}`;
+const isExplainPrompt = (prompt) =>
+  prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
 
 export async function startCodexProxy({
   chatgptBaseURL = CHATGPT_BASE_URL,
@@ -173,151 +200,225 @@ export async function startCodexProxy({
   const states = new Map();
   const models = new Map();
 
+  const isModelsList = (req) => req.method === "GET" && /\/models(?:\?|$)/.test(req.url ?? "");
+
+  // A spawned subagent names its own model (spawn_agent's `model`). As with Claude, that
+  // model is a ceiling: Jev may pick cheaper, never dearer. Only a conversation that starts
+  // after a routed main conversation counts as a subagent.
+  function subagentCeilingOf(body, known) {
+    if (body.model === CODEX_AUTO_MODEL || !codexTierOf(body.model)) return null;
+    if (known) return known.ceiling ?? null;
+    return [...states.values()].some((s) => s.model && !s.ceiling) ? codexTierOf(body.model) : null;
+  }
+
+  // Anything that is not the sentinel is a model the user chose: pass it through untouched.
+  function passThroughUserChoice(body, key, known) {
+    const prompt = codexNewTurnPrompt(body);
+    if (!prompt || isExplainPrompt(prompt)) return;
+    markManual(statusId);
+    // Remember the conversation as manual so a later subagent check does not mistake it.
+    if (!known) remember(states, key, { manual: true });
+  }
+
+  /** Asks Jev about a fresh user turn and remembers the answer for the turn's follow-ups. */
+  async function routeFreshTurn({ body, prompt, key, known, ceiling, candidates, current, currentModel }) {
+    const contextTokens = Math.round(JSON.stringify(body.input).length / 4);
+    const turn = await routeTurn({
+      route,
+      prompt,
+      models: candidates,
+      current,
+      currentModel,
+      contextTokens,
+      cacheBuilt: known?.tier != null && cacheIsWarm(known?.lastAt),
+      modelForTier: (t) => modelForTier(candidates, t),
+      newest: true,
+      context: codexPreviousReply(body),
+    });
+    let { tier, model } = turn;
+    if (ceiling && rankOf(tier) > rankOf(ceiling)) {
+      tier = ceiling;
+      model = modelForTier(candidates, tier);
+    }
+    const effort = turn.jev?.effort ?? null;
+    remember(states, key, { ...known, tier, model, effort, ...(ceiling ? { ceiling } : {}) });
+    debug(`${key} ${current} -> ${tier} (${turn.reason}) | ${prompt.slice(0, 60)}`);
+    return {
+      tier,
+      model,
+      effort,
+      routing: {
+        prompt,
+        tier,
+        model,
+        confidence: turn.jev?.confidence ?? null,
+        metrics: turn.jev?.metrics ?? null,
+        reason: turn.reason,
+        jev: turn.jev ? { request: turn.jev.request, response: turn.jev.response } : null,
+        at: Date.now(),
+      },
+    };
+  }
+
+  /**
+   * Rewrites a sentinel request to the model chosen for its turn, asking Jev first when the
+   * request opens a new turn. Returns the tier that served it, and the decision to announce.
+   */
+  async function routeAuto(body, key, known, subagentCeiling) {
+    const ceiling = subagentCeiling ?? known?.ceiling ?? null;
+    const candidates = codexModels(models).filter(
+      (model) => availableTiers().includes(model.tier) && (!ceiling || rankOf(model.tier) <= rankOf(ceiling)),
+    );
+    // Jev leans toward the model it is told is current, so starting on the strongest
+    // model made every Codex session answer "strongest". Start in the middle instead.
+    const start = ceiling && rankOf(ceiling) < rankOf("sonnet") ? ceiling : "sonnet";
+    const currentModel = known?.model ?? modelForTier(candidates, start);
+    const current = codexTierOf(currentModel) ?? start;
+    const prompt = codexNewTurnPrompt(body);
+
+    const fresh =
+      prompt && !isExplainPrompt(prompt)
+        ? await routeFreshTurn({ body, prompt, key, known, ceiling, candidates, current, currentModel })
+        : null;
+    const { tier, model, effort } = fresh ?? { tier: current, model: currentModel, effort: known?.effort ?? null };
+
+    // Any request refreshes the provider's cache; a long idle gap lets it expire.
+    const routed = states.get(key);
+    if (routed) routed.lastAt = Date.now();
+    applyCodexTier(body, tier, models, model);
+    setCodexEffort(body, effort);
+    if (fresh) {
+      // Read after both rewrites, so the decision shows the effort that was actually sent.
+      fresh.routing.effort = body.reasoning?.effort ?? null;
+      writeDecision(statusId, fresh.routing);
+    }
+    return { servedTier: tier, routing: fresh?.routing };
+  }
+
+  /** Routes a /responses request. Returns the body to send, the serving tier and the decision. */
+  async function routeResponses(raw) {
+    let body = null;
+    try {
+      body = JSON.parse(raw.toString());
+      if (process.env.JEV_DUMP) dumpBody(body);
+      const key = codexConversationKey(body);
+      const known = states.get(key);
+      const ceiling = subagentCeilingOf(body, known);
+      let routed = {};
+      if (body.model === CODEX_AUTO_MODEL || ceiling) routed = await routeAuto(body, key, known, ceiling);
+      else passThroughUserChoice(body, key, known);
+      return { out: Buffer.from(JSON.stringify(body)), ...routed };
+    } catch (err) {
+      debug(`codex passthrough, could not process body: ${err.message}`);
+      // The sentinel is not a real model: sent as is, the request would fail instead of just
+      // missing its routing.
+      if (body?.model === CODEX_AUTO_MODEL) {
+        applyCodexTier(body, "sonnet", models);
+        return { out: Buffer.from(JSON.stringify(body)) };
+      }
+      return { out: raw };
+    }
+  }
+
+  // Codex lists models first; the proxy adds its own entry and learns the catalog from it.
+  function relayModelCatalog(response, res) {
+    const headers = { ...response.headers };
+    const chunks = [];
+    response.on("data", (chunk) => chunks.push(chunk));
+    response.on("end", () => {
+      let data = Buffer.concat(chunks);
+      try {
+        const catalog = addJevModel(JSON.parse(data.toString()));
+        for (const model of catalog.models) models.set(model.slug, model);
+        data = Buffer.from(JSON.stringify(catalog));
+        delete headers["content-length"];
+      } catch (err) {
+        debug(`could not extend Codex model catalog: ${err.message}`);
+      }
+      res.writeHead(response.statusCode, headers);
+      res.end(data);
+    });
+  }
+
+  // Splices a "[Jev] routed this turn…" note in after the stream's first event. Bytes, not
+  // strings: a chunk can end in the middle of a multi-byte character, and decoding it here
+  // would replace that character with U+FFFD.
+  function relayWithDecision(response, res, routing) {
+    let pending = Buffer.alloc(0);
+    let inspected = false;
+    response.on("data", (chunk) => {
+      if (inspected) return void res.write(chunk);
+      pending = Buffer.concat([pending, chunk]);
+      const end = pending.indexOf("\n\n");
+      // No event boundary in the first 64 KB: this is not an SSE stream we can splice into.
+      if (end < 0 && pending.length < 65536) return;
+      const split = end < 0 ? pending.length : end + 2;
+      const first = pending.subarray(0, split);
+      res.write(first);
+      const isSSE = end >= 0 && /^(?:event|data):/m.test(first.toString());
+      if (isSSE) res.write(jevDecisionEvents(routing));
+      debug(`codex decision display ${isSSE ? "inject" : "skip"}`);
+      if (split < pending.length) res.write(pending.subarray(split));
+      pending = Buffer.alloc(0);
+      inspected = true;
+    });
+    response.on("end", () => {
+      if (pending.length) {
+        debug("codex decision display skip");
+        res.write(pending);
+      }
+      res.end();
+    });
+  }
+
+  function recordResponseUsage(response, tier) {
+    const chunks = [];
+    response.on("data", (chunk) => chunks.push(chunk));
+    response.on("end", () =>
+      recordUsage(statusId, tier, usageFromBody(Buffer.concat(chunks), response.headers["content-encoding"])),
+    );
+  }
+
+  function relay(response, req, res, { routing, servedTier }) {
+    if (isModelsList(req)) return relayModelCatalog(response, res);
+    // A compressed stream cannot be read or spliced as text, so it is passed through untouched.
+    const announce =
+      routing && response.statusCode >= 200 && response.statusCode < 300 && !response.headers["content-encoding"];
+    const headers = { ...response.headers };
+    if (announce) delete headers["content-length"];
+    res.writeHead(response.statusCode, headers);
+    if (servedTier && response.statusCode === 200) recordResponseUsage(response, servedTier);
+    if (announce) relayWithDecision(response, res, routing);
+    else response.pipe(res);
+  }
+
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", async () => {
-      let out = Buffer.concat(chunks);
-      let routing;
-      if (req.method === "POST" && /\/responses(?:\?|$)/.test(req.url ?? "")) {
-        try {
-          const body = JSON.parse(out.toString());
-          if (process.env.JEV_DUMP) {
-            writeFileSync(`${process.env.JEV_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
-          }
-          if (body.model === CODEX_AUTO_MODEL) {
-            const key = codexConversationKey(body);
-            const candidates = codexModels(models).filter((model) =>
-              availableTiers().includes(model.tier),
-            );
-            const available = [...new Set(candidates.map((model) => model.tier))];
-            const currentModel = states.get(key)?.model ?? modelForTier(candidates, "opus");
-            const current = codexTierOf(currentModel) ?? "opus";
-            const prompt = codexNewTurnPrompt(body);
-            const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
-            let tier = current;
-            let model = currentModel;
-            if (prompt && !explaining) {
-              const contextTokens = Math.round(JSON.stringify(body.input).length / 4);
-              const jev = await route({ prompt, current: currentModel, contextTokens, models: candidates });
-              const chosen = candidates.find((candidate) => candidate.id === jev?.choice);
-              const decision = decide({
-                prompt,
-                jev: jev && { ...jev, choice: chosen?.tier },
-                current,
-                available,
-                contextTokens,
-              });
-              tier = decision.tier;
-              model =
-                shouldUseExactModel(decision.reason, chosen?.tier, tier)
-                  ? chosen.id
-                  : tier === current
-                    ? currentModel
-                    : modelForTier(candidates, tier);
-              states.set(key, { tier, model });
-              routing = {
-                prompt,
-                tier,
-                model,
-                confidence: jev?.confidence ?? null,
-                metrics: jev?.metrics ?? null,
-                reason: decision.reason,
-                jev: jev ? { request: jev.request, response: jev.response } : null,
-                at: Date.now(),
-              };
-              writeDecision(statusId, routing);
-              debug(`${key} ${current} -> ${tier} (${decision.reason}) | ${prompt.slice(0, 60)}`);
-            }
-            applyCodexTier(body, tier, models, model);
-          } else {
-            const prompt = codexNewTurnPrompt(body);
-            const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
-            if (prompt && !explaining) writeStatus(statusId, { manual: true, at: Date.now() });
-          }
-          out = Buffer.from(JSON.stringify(body));
-        } catch (err) {
-          debug(`codex passthrough, could not process body: ${err.message}`);
-        }
-      }
-
-      const base = upstreamFor(req.headers, req.url, chatgptBaseURL, apiBaseURL);
-      const target = new URL(base);
-      const transport = target.protocol === "http:" ? http : https;
-      const headers = { ...req.headers, host: target.host };
-      delete headers["content-length"];
-      const upstream = transport.request(
-        {
-          hostname: target.hostname,
-          port: target.port || undefined,
-          path: upstreamPath(base, req.url ?? "/"),
-          method: req.method,
-          headers,
-        },
-        (response) => {
-          const responseHeaders = { ...response.headers };
-          const isModels = req.method === "GET" && /\/models(?:\?|$)/.test(req.url ?? "");
-          if (isModels) {
-            const body = [];
-            response.on("data", (chunk) => body.push(chunk));
-            response.on("end", () => {
-              let data = Buffer.concat(body);
-              try {
-                const catalog = addJevModel(JSON.parse(data.toString()));
-                for (const model of catalog.models) models.set(model.slug, model);
-                data = Buffer.from(JSON.stringify(catalog));
-                delete responseHeaders["content-length"];
-              } catch (err) {
-                debug(`could not extend Codex model catalog: ${err.message}`);
-              }
-              res.writeHead(response.statusCode, responseHeaders);
-              res.end(data);
-            });
-            return;
-          }
-
-          const inspectForDecision = routing && response.statusCode >= 200 && response.statusCode < 300;
-          if (inspectForDecision) delete responseHeaders["content-length"];
-          res.writeHead(response.statusCode, responseHeaders);
-          if (!inspectForDecision) {
-            response.pipe(res);
-            return;
-          }
-          let pending = "";
-          let inspected = false;
-          response.on("data", (chunk) => {
-            if (inspected) return void res.write(chunk);
-            pending += chunk.toString();
-            const end = pending.indexOf("\n\n");
-            if (end < 0) return;
-            const first = pending.slice(0, end + 2);
-            res.write(first);
-            const isSSE = /^(?:event|data):/m.test(first);
-            if (isSSE) res.write(jevDecisionEvents(routing));
-            debug(`codex decision display ${isSSE ? "inject" : "skip"}`);
-            res.write(pending.slice(end + 2));
-            pending = "";
-            inspected = true;
-          });
-          response.on("end", () => {
-            if (pending) {
-              debug("codex decision display skip");
-              res.write(pending);
-            }
-            res.end();
-          });
-        },
-      );
-      upstream.on("error", (err) => {
-        debug(`codex upstream error: ${err.message}`);
-        if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: err.message, type: "proxy_error" } }));
+      const raw = Buffer.concat(chunks);
+      const routed =
+        req.method === "POST" && /\/responses(?:\?|$)/.test(req.url ?? "")
+          ? await routeResponses(raw)
+          : { out: raw };
+      forward({
+        target: upstreamFor(req.headers, req.url, chatgptBaseURL, apiBaseURL),
+        req,
+        res,
+        headers: req.headers,
+        body: routed.out,
+        errorBody: (message) => ({ error: { message, type: "proxy_error" } }),
+        onResponse: (response) => relay(response, req, res, routed),
       });
-      if (out.length) upstream.write(out);
-      upstream.end();
     });
   });
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { port: server.address().port, close: () => server.close() };
+  return {
+    port: server.address().port,
+    close: () => {
+      server.close();
+      server.closeAllConnections();
+    },
+  };
 }

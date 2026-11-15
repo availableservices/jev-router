@@ -36,10 +36,11 @@ flowchart TB
     parse --> mode{"model is `jev-router`?"}
 
     mode -- No --> pass["Leave model unchanged\nFor agent requests, publish manual status"]
-    mode -- Yes --> conversation["Build conversation key\nsession ID + first-message text\nKeep up to 50 independent states"]
-    conversation --> fresh{"Fresh user turn?\n(tool-bearing, last user text,\nnot a tool-result continuation)"}
-    fresh -- No --> pinned["Reuse tier pinned for this conversation\n(default: sonnet)"]
-    fresh -- Yes --> prompt["Remove system-reminder blocks\nEstimate context tokens"]
+    mode -- Yes --> conversation["Build conversation key\nsession ID + first-message text\nKeep the 50 most recently used states"]
+    conversation --> fresh{"Fresh user turn?\n(tool-bearing, last non-system message\nis user text, not a tool-result continuation)"}
+    fresh -- No --> pinned["Reuse tier pinned for this conversation\n(default: opus until a turn is routed)"]
+    fresh -- Yes --> catalog["Fetch the account's model catalog\nwhen missing or older than 1 hour"]
+    catalog --> prompt["Remove system-reminder blocks\nEstimate context tokens"]
     prompt --> jev
     jev --> policy
     policy --> saveTier["Pin chosen tier in conversation state"]
@@ -52,8 +53,8 @@ flowchart TB
 
   subgraph routing["Routing — src/router.mjs + src/policy.mjs"]
     direction TB
-    jev["TypeSafe / Jev systemOne call\nSends only fresh user prompt plus:\ncurrent tier, approximate context, available tiers"]
-    policy["Policy resolves final tier\n• prompt override wins\n• failure / malformed answer: keep current\n• low confidence: no downgrade; upgrades capped at sonnet\n• large context: no downgrade that rebuilds cache\n• unavailable tier: choose nearest stronger available\n• fable requires JEV_ALLOW_FABLE=1"]
+    jev["TypeSafe / Jev systemOne call\nSends only fresh user prompt plus:\ncurrent model, approximate context, available models"]
+    policy["Policy resolves final tier (src/turn.mjs → src/policy.mjs)\n• prompt override wins\n• failure / malformed answer: keep current\n• low confidence: no downgrade; upgrades capped at sonnet\n• large context: no downgrade that rebuilds a cache\n  we built (not on a conversation's first routed turn)\n• unavailable tier: choose nearest stronger available\n• fable requires JEV_ALLOW_FABLE=1"]
   end
 
   forward --> anthropic["Anthropic API"]

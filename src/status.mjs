@@ -36,11 +36,30 @@ export function writeStatus(sessionId, status) {
   }
 }
 
-/** Publish a routed prompt and retain recent exact Jev exchanges for diagnosis. */
+/**
+ * Publish a routed prompt and retain recent exact Jev exchanges for diagnosis. Token totals
+ * survive a new decision, so the session's usage is not lost each turn.
+ */
 export function writeDecision(sessionId, decision) {
   const previous = readStatus(sessionId);
   const history = [...(previous?.history ?? []), decision].slice(-20);
-  writeStatus(sessionId, { ...decision, history });
+  writeStatus(sessionId, { ...decision, history, usage: previous?.usage });
+}
+
+/** Marks the session as driven by the user's own model choice, keeping what was recorded. */
+export function markManual(sessionId) {
+  writeStatus(sessionId, { ...readStatus(sessionId), manual: true, at: Date.now() });
+}
+
+/** Adds one response's token counts to a session's running totals for `tier`. */
+export function recordUsage(sessionId, tier, usage) {
+  if (!sessionId || !tier || !usage) return;
+  const previous = readStatus(sessionId) ?? {};
+  const totals = previous.usage ?? {};
+  const row = totals[tier] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, requests: 0 };
+  for (const k of ["input", "output", "cacheRead", "cacheWrite"]) row[k] += usage[k] ?? 0;
+  row.requests += 1;
+  writeStatus(sessionId, { ...previous, usage: { ...totals, [tier]: row } });
 }
 
 /** Latest routing decision for a session, or null if none has been made yet. */

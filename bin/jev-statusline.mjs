@@ -28,7 +28,11 @@ if (status?.manual) {
   routed = `${DIM}⏸ manual${RESET} ${input.model?.display_name ?? ""}`.trimEnd();
 } else if (status) {
   const color = COLOR[status.tier] ?? "";
-  const p = status.confidence != null ? ` ${DIM}(p=${status.confidence.toFixed(2)})${RESET}` : "";
+  // Confidence and the effort actually sent sit together: both say how hard Jev judged the turn.
+  const facts = [];
+  if (status.confidence != null) facts.push(`p=${status.confidence.toFixed(2)}`);
+  if (status.effort) facts.push(`effort ${status.effort}`);
+  const p = facts.length ? ` ${DIM}(${facts.join(" · ")})${RESET}` : "";
   // Only name the reason when routing declined to do the obvious thing, so the common case
   // stays short and the interesting case explains itself.
   const held =
@@ -36,7 +40,9 @@ if (status?.manual) {
     status.reason !== "jev" &&
     status.reason !== "jev/no-change" &&
     !status.reason.includes("override");
-  const why = held ? ` ${DIM}(${status.reason.split("/")[0]})${RESET}` : "";
+  // A held downgrade is the one case the user can act on: compacting or clearing makes it cheap.
+  const hint = status.reason.includes("cache-rebuild") ? ": /compact or /clear to allow the downgrade" : "";
+  const why = held ? ` ${DIM}(${status.reason.split("/")[0]}${hint})${RESET}` : "";
   routed = `${color}${status.model ?? status.tier}${RESET}${p}${why}`;
 }
 

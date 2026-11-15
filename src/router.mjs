@@ -3,6 +3,8 @@ import {
   COMPLEXITY_MAX_SCORE,
   CONTEXT_WINDOW_TOKENS,
   QUESTIONS,
+  effortEnabled,
+  effortQuestion,
   questionForModels,
   THRESHOLDS,
 } from "./config.mjs";
@@ -24,29 +26,67 @@ function getClient() {
 }
 
 /**
+ * Stops asking a failing Jev for a while. Each failed ask costs the full deadline on every turn,
+ * so after a few in a row the router keeps the current model without waiting.
+ */
+export function createBreaker({
+  failures = THRESHOLDS.jevBreakerFailures,
+  cooldownMs = THRESHOLDS.jevBreakerCooldownMs,
+} = {}) {
+  let count = 0;
+  let openUntil = 0;
+  return {
+    open: (now = Date.now()) => now < openUntil,
+    fail(now = Date.now()) {
+      if (++count >= failures) {
+        openUntil = now + cooldownMs;
+        count = 0;
+      }
+    },
+    ok() {
+      count = 0;
+    },
+  };
+}
+const breaker = createBreaker();
+
+function buildRequest({ prompt, context, current, contextTokens, models }) {
+  return {
+    state: {
+      // A reply like "ok, do it" or "fix all 6" only means something next to what it answers.
+      request: context
+        ? `Previous assistant message (context for the request below):\n${context}\n\nUser request:\n${prompt}`
+        : prompt,
+      session: { current_model: current, context_tokens: contextTokens },
+      environment: { available_models: models.map((model) => model.id) },
+    },
+    questions: {
+      ...QUESTIONS,
+      model: questionForModels(models),
+      ...(effortEnabled() ? { effort: effortQuestion() } : {}),
+    },
+  };
+}
+
+/**
  * Asks Jev which tier fits this prompt. Returns null on any failure, which the policy
  * layer reads as "keep the current model" — routing must never block a prompt.
  *
  * @returns {Promise<?{choice: string, confidence: number, probabilities: object, metrics: object, ms: number}>}
  */
-export async function askJev({ prompt, current, contextTokens, models }) {
-  if (!models?.length) return null;
+export async function askJev({ prompt, context, current, contextTokens, models }) {
+  if (!models?.length || breaker.open()) return null;
   const started = Date.now();
   const abort = new AbortController();
   const deadline = setTimeout(() => abort.abort(), THRESHOLDS.jevDeadlineMs);
-  const request = {
-    state: {
-      request: prompt,
-      session: { current_model: current, context_tokens: contextTokens },
-      environment: { available_models: models.map((model) => model.id) },
-    },
-    questions: { ...QUESTIONS, model: questionForModels(models) },
-  };
+  const request = buildRequest({ prompt, context, current, contextTokens, models });
   try {
     const result = await getClient().systemOne(request, { signal: abort.signal });
     const { model: answer, task_complexity, reasoning_required, tool_complexity } = result.answers;
+    breaker.ok();
     return {
       ...answer,
+      effort: result.answers.effort?.choice ?? null,
       request,
       response: result,
       metrics: {
@@ -59,6 +99,7 @@ export async function askJev({ prompt, current, contextTokens, models }) {
     };
   } catch (err) {
     log(`routing failed, keeping ${current}: ${err.message}`);
+    breaker.fail();
     return null;
   } finally {
     clearTimeout(deadline);

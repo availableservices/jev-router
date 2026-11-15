@@ -32,9 +32,10 @@ function clampToAvailable(tier, available) {
  * @param {string} input.current       tier currently active in the session
  * @param {string[]} input.available   tier names the account can run
  * @param {number} input.contextTokens approximate size of the conversation so far
+ * @param {boolean} input.cacheBuilt   whether a turn was already routed on `current`
  * @returns {{tier: string, reason: string, changed: boolean}}
  */
-export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
+export function decide({ prompt, jev, current, available, contextTokens = 0, cacheBuilt = true }) {
   const settle = (tier, reason) => {
     const final = clampToAvailable(tier, available) ?? current;
     const why = final === tier ? reason : `${reason}+unavailable`;
@@ -48,13 +49,21 @@ export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
 
   let target = jev.choice;
 
-  if (jev.confidence < THRESHOLDS.minConfidence) {
+  // Written as a negation so a missing or NaN confidence counts as unsure, not as certain.
+  if (!(jev.confidence >= THRESHOLDS.minConfidence)) {
     if (rankOf(target) < rankOf(current)) return settle(current, "low-confidence-no-downgrade");
     const ceiling = Math.max(rankOf(current), rankOf(THRESHOLDS.uncertainCeiling));
     if (rankOf(target) > ceiling) return settle(TIER_NAMES[ceiling], "low-confidence-capped");
   }
 
-  if (rankOf(target) < rankOf(current) && contextTokens > THRESHOLDS.downgradeMaxContextTokens) {
+  // Only worth protecting a cache we actually built: on the first routed turn `current` is
+  // just the caller's default, and Codex alone sends a ~22k-token preamble, so applying this
+  // guard there would refuse every downgrade for the whole session.
+  if (
+    cacheBuilt &&
+    rankOf(target) < rankOf(current) &&
+    contextTokens > THRESHOLDS.downgradeMaxContextTokens
+  ) {
     return settle(current, "downgrade-not-worth-cache-rebuild");
   }
 
